@@ -52,14 +52,26 @@ st.markdown("### فريق وكلاء: فني + أخبار + مخاطر")
 # =====================================================================
 # 🔄 دوال جلب النماذج ديناميكياً (تعمل مع أي إصدار مستقبلي)
 # =====================================================================
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_gemini_models():
-    """جلب نماذج Gemini المتاحة لحسابك تلقائياً، مرتّبة بالأولوية."""
+    """جلب نماذج Gemini 3.x فقط (يستبعد 2.5 وأقدم — غير متاحة للمستخدمين الجدد)."""
+    fallback = [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.0-flash",
+        "gemini-3.8-pro",
+        "gemini-3.7-pro",
+    ]
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         names = [m.name.replace("models/", "") for m in client.models.list()]
+
         banned = ("image", "live", "audio", "tts", "lite", "embedding",
-                  "aqa", "vision", "exp", "preview", "thinking")
+                  "aqa", "vision", "exp", "preview", "thinking",
+                  "2.5", "2.0", "1.5", "1.0")
+
         cands = [n for n in names
                  if "gemini" in n.lower()
                  and ("flash" in n.lower() or "pro" in n.lower())
@@ -69,16 +81,19 @@ def get_gemini_models():
             m = re.search(r"gemini-(\d+)\.(\d+)", n)
             return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
-        cands.sort(key=ver_key, reverse=True)
-        cands.sort(key=lambda n: 0 if "flash" in n.lower() else 1)
-        return cands[:5] if cands else ["gemini-3.8-flash"]
+        cands.sort(key=lambda n: (0 if "flash" in n.lower() else 1,
+                                  -ver_key(n)[0], -ver_key(n)[1]))
+
+        combined = cands + [f for f in fallback if f not in cands]
+        return combined[:6]
     except Exception:
-        return ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"]
+        return fallback[:5]
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_groq_models():
     """جلب نماذج Groq المتاحة، مرتّبة بالأولوية."""
+    fallback = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
     try:
         client = Groq(api_key=GROQ_API_KEY)
         names = [m.id for m in client.models.list().data]
@@ -89,9 +104,10 @@ def get_groq_models():
         priority += [n for n in names if n not in priority]
         banned = ("whisper", "tts", "vision", "guard", "prompt-guard", "embedding")
         priority = [n for n in priority if not any(x in n.lower() for x in banned)]
-        return priority[:4] if priority else ["openai/gpt-oss-120b"]
+        combined = priority + [f for f in fallback if f not in priority]
+        return combined[:4]
     except Exception:
-        return ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+        return fallback
 
 
 # ---------------------------------------------------------------------
@@ -962,7 +978,7 @@ with st.sidebar:
             st.code("\n".join(get_gemini_models()) or "لا شيء")
             st.markdown("**Groq (سيُجرَّب بهذا الترتيب):**")
             st.code("\n".join(get_groq_models()) or "لا شيء")
-            st.caption("إذا ظهرت القائمة فارغة، اضغط الزر مرة أخرى بعد دقيقة (قد يكون API مشغولاً).")
+            st.caption("إذا ظهرت القائمة فارغة، اضغط الزر مرة أخرى بعد دقيقة.")
 
 
 # ---------------------------------------------------------------------
