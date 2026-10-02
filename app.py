@@ -54,7 +54,7 @@ st.markdown("### فريق وكلاء: فني + أخبار + مخاطر")
 # =====================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_gemini_models():
-    """جلب نماذج Gemini المتاحة لحسابك، مرتّبة بالأولوية."""
+    """جلب نماذج Gemini المتاحة لحسابك تلقائياً، مرتّبة بالأولوية."""
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         names = [m.name.replace("models/", "") for m in client.models.list()]
@@ -71,9 +71,9 @@ def get_gemini_models():
 
         cands.sort(key=ver_key, reverse=True)
         cands.sort(key=lambda n: 0 if "flash" in n.lower() else 1)
-        return cands[:5] if cands else ["gemini-2.5-flash"]
+        return cands[:5] if cands else ["gemini-3.8-flash"]
     except Exception:
-        return ["gemini-2.5-flash", "gemini-2.5-pro"]
+        return ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1058,8 +1058,7 @@ if a is not None:
         with st.expander("تفاصيل النقاط"):
             for label, pts_, mx, note in a["parts"]:
                 st.markdown(f"- **{label}:** {pts_:g}/{mx} — {note}")
-            st.caption("هذه نقاط جودة تجمع الفلاتر والوكلاء والأداء التاريخي، وليست احتمال ربح. "
-                       "لا تُفسَّر كنسبة نجاح إلا بعد معايرتها على نتائج صفقاتك الفعلية.")
+            st.caption("هذه نقاط جودة تجمع الفلاتر والوكلاء والأداء التاريخي، وليست احتمال ربح.")
 
     st.markdown(f"**الرمز:** {a['ticker']} | **الاستراتيجية المستخدمة:** {a['used']} | **الإطار:** {a.get('tf', TF_D1)} | **وقت التحليل:** {a['time']}")
 
@@ -1135,7 +1134,7 @@ if a is not None:
                     for src_ in ag["news_sources"]:
                         st.markdown(f"- [{src_['title']}]({src_['uri']})")
                 else:
-                    st.warning("⚠️ لم يُرجع البحث أي مصادر — قد تكون النتيجة من معرفة النموذج وليست أخباراً حيّة. تحقق يدوياً.")
+                    st.warning("⚠️ لم يُرجع البحث أي مصادر.")
 
         with st.expander("🛡️ وكيل المخاطر", expanded=True):
             if ag.get("risk_model"):
@@ -1166,8 +1165,7 @@ if a is not None:
             st.success("📨 أُرسل تنبيه تيليجرام.")
         elif a.get("tg"):
             st.warning(a["tg"])
-        st.caption("القرار بقواعد ثابتة: اعتراض المخاطر أو رفض الفني = لا دخول، وأي تحفظ = نصف الحجم، "
-                   "ولا تنبيه دخول إلا إذا بلغت نقاط الجودة الحد المطلوب.")
+        st.caption("القرار بقواعد ثابتة: اعتراض المخاطر أو رفض الفني = لا دخول، وأي تحفظ = نصف الحجم.")
 
 
 # ---------------------------------------------------------------------
@@ -1325,8 +1323,7 @@ if bt and "results" in bt and isinstance(bt.get("buy_hold"), dict):
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         st.caption("الشراء والاحتفاظ في نفس الفترة: " +
-                   " | ".join(f"{short(tf)}: {v:+.1f}%" for tf, v in bt["buy_hold"].items()) +
-                   ". «متوسط R» = متوسط الربح لكل صفقة بوحدة المخاطرة؛ فوق 0.2 بعد التكلفة يُعتبر مقبولاً.")
+                   " | ".join(f"{short(tf)}: {v:+.1f}%" for tf, v in bt["buy_hold"].items()))
 
         valid = {k: r["stats"] for k, r in bt["results"].items() if r["stats"]["trades"] >= 30}
         if valid:
@@ -1361,7 +1358,7 @@ if bt and "results" in bt and isinstance(bt.get("buy_hold"), dict):
             show[["entry", "exit", "pnl", "r"]] = show[["entry", "exit", "pnl", "r"]].round(2)
             st.dataframe(show, use_container_width=True, hide_index=True)
 
-        st.caption("⚠️ الأداء السابق لا يضمن المستقبل. اختبر عدة رموز ومدد، وتجنّب تعديل الأرقام حتى تعطي أفضل نتيجة (Overfitting).")
+        st.caption("⚠️ الأداء السابق لا يضمن المستقبل.")
 
 st.markdown("---")
 st.caption("تنبيه: هذا التطبيق لأغراض تعليمية فقط، ولا يعد نصيحة مالية.")
