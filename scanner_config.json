@@ -1,0 +1,11 @@
+{
+  "symbols": ["GC=F", "EURUSD=X", "BTC-USD"],
+  "timeframe": "dual",
+  "strategy": "auto",
+  "threshold": 85,
+  "balance": 10000,
+  "risk_pct": 1.0,
+  "max_signal_age_hours": 6,
+  "daily_summary": true,
+  "summary_hour_utc": 6
+}
