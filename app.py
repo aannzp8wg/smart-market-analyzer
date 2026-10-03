@@ -4,10 +4,11 @@ st.set_page_config(page_title="محلل السوق الذكي", page_icon="🤖"
 
 import json
 import math
+import os
 import re
+import tempfile
 import time
 import traceback
-import random
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -17,6 +18,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import streamlit.components.v1 as components
 import yfinance as yf
 from google import genai
 from google.genai import types
@@ -56,6 +58,122 @@ st.markdown("### فريق وكلاء: فني + أخبار + مخاطر")
 # ---------------------------------------------------------------------
 # تهيئة الجلسة
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# السجل الدائم للصفقات (GitHub Gist، أو ملف مؤقت إن لم يُضبط)
+# ---------------------------------------------------------------------
+JOURNAL_FILE = os.path.join(tempfile.gettempdir(), "trading_journal.json")
+
+
+def _gist_cfg():
+    try:
+        tok, gid = st.secrets.get("GITHUB_TOKEN"), st.secrets.get("GIST_ID")
+    except Exception:
+        return None
+    return (str(tok), str(gid)) if tok and gid else None
+
+
+def storage_mode():
+    return "gist" if _gist_cfg() else "local"
+
+
+def _jdump(obj):
+    return json.dumps(obj, ensure_ascii=False,
+                      default=lambda o: float(o) if isinstance(o, (np.floating, np.integer)) else str(o))
+
+
+def _gist_req(url, tok, body=None, method="GET"):
+    req = urllib.request.Request(url, data=body, method=method, headers={
+        "Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json",
+        "User-Agent": "trading-journal", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
+
+
+def _scrub(msg, cfg):
+    return (msg.replace(cfg[0], "***") if cfg else msg)[:160]
+
+
+def journal_load():
+    """يرجع (dict فيه trades وposition، رسالة خطأ). أي خطأ يوقف الحفظ لاحقاً حمايةً للبيانات."""
+    empty = {"trades": [], "position": None}
+    cfg = _gist_cfg()
+    try:
+        if cfg:
+            data = _gist_req(f"https://api.github.com/gists/{cfg[1]}", cfg[0])
+            f = (data.get("files") or {}).get("trades.json")
+            if not f:
+                return empty, "لا يوجد ملف باسم trades.json داخل الـ Gist (أنشئه بمحتوى {})."
+            txt = (f.get("content") or "").strip()
+            obj = json.loads(txt) if txt else {}
+        else:
+            if not os.path.exists(JOURNAL_FILE):
+                return empty, ""
+            with open(JOURNAL_FILE, encoding="utf-8") as fh:
+                obj = json.load(fh)
+        if isinstance(obj, list):
+            obj = {"trades": obj}
+        if not isinstance(obj, dict):
+            obj = {}
+        trades = obj.get("trades")
+        return {"trades": trades if isinstance(trades, list) else [], "position": obj.get("position")}, ""
+    except Exception as e:
+        return empty, _scrub(f"{type(e).__name__}: {e}", cfg)
+
+
+def journal_save(trades, position):
+    obj = {"version": 1, "trades": trades, "position": position}
+    cfg = _gist_cfg()
+    try:
+        if cfg:
+            body = json.dumps({"files": {"trades.json": {"content": _jdump(obj)}}}).encode()
+            _gist_req(f"https://api.github.com/gists/{cfg[1]}", cfg[0], body, "PATCH")
+        else:
+            with open(JOURNAL_FILE, "w", encoding="utf-8") as fh:
+                fh.write(_jdump(obj))
+        return ""
+    except Exception as e:
+        return _scrub(f"{type(e).__name__}: {e}", cfg)
+
+
+def persist():
+    """يحفظ السجل والصفقة المفتوحة (ولا يحفظ إذا فشل التحميل الأول، لئلا يُمسح سجلك الموجود)."""
+    if not st.session_state.get("journal_ok", True):
+        st.session_state["journal_save_err"] = "الحفظ متوقف لأن تحميل السجل فشل — أصلح الخطأ ثم أعد تحميل الصفحة."
+        return
+    st.session_state["journal_save_err"] = journal_save(st.session_state.trades, st.session_state.current_position)
+
+
+def journal_groups(tdf):
+    """إحصاءات الأداء مجمّعة (استراتيجية/إطار/نقاط/مصدر...). ترجع [(العنوان، DataFrame)]."""
+    d = tdf.copy()
+    d["win"] = d["pnl_percent"] > 0
+    for c in ("r_multiple", "score"):
+        d[c] = pd.to_numeric(d[c], errors="coerce") if c in d else np.nan
+    for c in ("used", "tf", "source", "direction", "regime"):
+        if c not in d:
+            d[c] = None
+    first = lambda x: str(x).split(" (")[0] if isinstance(x, str) and x else None
+    d["الاستراتيجية"] = d["used"].map(first)
+    d["الإطار"] = d["tf"].map(first)
+    d["المصدر"] = d["source"].map({"plan": "حسب الخطة", "manual": "يدوي"})
+    d["الاتجاه"] = d["direction"]
+    d["حالة السوق"] = d["regime"].map(lambda x: x if isinstance(x, str) and x else None)
+    d["نقاط الجودة"] = pd.cut(d["score"], [-1, 69, 79, 84, 100], labels=["أقل من 70", "70–79", "80–84", "85 فأكثر"]).astype(object)
+    out = []
+    for col in ("نقاط الجودة", "الاستراتيجية", "الإطار", "المصدر", "الاتجاه", "حالة السوق"):
+        sub = d.dropna(subset=[col])
+        if sub.empty:
+            continue
+        g = sub.groupby(col).agg(n=("win", "size"), wr=("win", "mean"), r=("r_multiple", "mean"),
+                                 tot=("pnl_percent", "sum")).reset_index()
+        g["wr"] = (g["wr"] * 100).round(1)
+        g["r"] = g["r"].round(2)
+        g["tot"] = g["tot"].round(2)
+        g.columns = [col, "الصفقات", "نسبة الربح %", "متوسط R", "الإجمالي %"]
+        out.append((col, g))
+    return out
+
+
 defaults = {
     "trades": [],
     "current_position": None,
@@ -67,6 +185,14 @@ defaults = {
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+if "journal_loaded" not in st.session_state:   # تحميل السجل مرة واحدة لكل جلسة
+    _j, _jerr = journal_load()
+    st.session_state.trades = _j["trades"]
+    st.session_state.current_position = _j["position"]
+    st.session_state.journal_ok = not _jerr
+    st.session_state.journal_load_err = _jerr
+    st.session_state.journal_loaded = True
 
 
 # ---------------------------------------------------------------------
@@ -372,6 +498,97 @@ def as_list(v):
     if isinstance(v, list):
         return v
     return [v] if v else []
+
+
+# ---------------------------------------------------------------------
+# شارت TradingView الحي + شارت الصفقات
+# ---------------------------------------------------------------------
+TV_MAP = {"GC=F": "OANDA:XAUUSD", "SI=F": "OANDA:XAGUSD", "CL=F": "TVC:USOIL", "BZ=F": "TVC:UKOIL",
+          "NG=F": "CAPITALCOM:NATURALGAS", "BTC-USD": "BINANCE:BTCUSDT", "ETH-USD": "BINANCE:ETHUSDT",
+          "^GSPC": "SP:SPX", "^IXIC": "NASDAQ:IXIC", "^DJI": "DJ:DJI", "DX-Y.NYB": "TVC:DXY"}
+
+
+def guess_tv_symbol(t):
+    """رمز TradingView المقابل لرمز Yahoo (قابل للتعديل من الواجهة)."""
+    u = t.strip().upper()
+    if u in TV_MAP:
+        return TV_MAP[u]
+    if u.endswith("=X") and len(u) == 8:
+        return f"FX:{u[:6]}"
+    if u.endswith("-USD"):
+        return f"BINANCE:{u[:-4]}USDT"
+    return u
+
+
+def tradingview_html(symbol, interval, height=520):
+    cfg = {"autosize": True, "symbol": symbol, "interval": interval, "timezone": "Etc/UTC",
+           "theme": "dark", "style": "1", "locale": "en", "allow_symbol_change": True,
+           "withdateranges": True, "support_host": "https://www.tradingview.com"}
+    payload = json.dumps(cfg).replace("</", "<\\/")
+    return (f'<div class="tradingview-widget-container" style="height:{height}px;width:100%">'
+            f'<div class="tradingview-widget-container__widget" style="height:{height - 32}px;width:100%"></div>'
+            '<script type="text/javascript" '
+            'src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>'
+            f'{payload}</script></div>')
+
+
+def render_tv_chart(a=None):
+    sym_default = guess_tv_symbol(ticker)
+    with st.expander("📺 الشارت الحي (TradingView)", expanded=True):
+        c1, c2 = st.columns([2, 1])
+        sym = c1.text_input("رمز TradingView", value=sym_default, key=f"tv_sym_{ticker.strip().upper()}")
+        opts = ["15", "60", "240", "D", "W"]
+        labels = {"15": "15 دقيقة", "60": "ساعة", "240": "4 ساعات", "D": "يومي", "W": "أسبوعي"}
+        iv = c2.selectbox("الفريم", opts, index=opts.index("D") if timeframe == TF_D1 else opts.index("240"),
+                          format_func=lambda x: labels[x], key=f"tv_iv_{timeframe}")
+        components.html(tradingview_html(sym.strip() or sym_default, iv, 520), height=530)
+        pl = a.get("plan") if a else None
+        if pl and pl.get("direction") and a.get("ticker") == ticker.strip():
+            st.markdown(f"**مستويات الخطة:** الدخول `{P(pl['entry'])}` | الوقف `{P(pl['sl'])}` | "
+                        f"الهدف 1 `{P(pl['tp1'])}` | الهدف 2 `{P(pl['tp2'])}`")
+            st.caption("الودجت لا يرسم المستويات تلقائياً: أضف خطاً أفقياً عند كل سعر. وسعر TradingView (فوري) "
+                       "قد يختلف قليلاً عن سعر العقود الآجلة الذي يعتمد عليه التحليل، فاعتمد الفرق لا الرقم المطلق.")
+        else:
+            st.caption("إذا لم يظهر الشارت فاكتب رمزاً من TradingView (مثال: OANDA:XAUUSD أو BINANCE:BTCUSDT).")
+
+
+def create_trades_chart(df, tr, title, max_trades=25, max_bars=700):
+    """شموع + دخول (مثلث) وخروج (×) وخط بينهما لكل صفقة: أخضر رابحة، أحمر خاسرة."""
+    t = tr.tail(max_trades)
+    i0 = i1 = 0
+    while True:
+        i0 = max(int(df.index.searchsorted(t["entry_date"].iloc[0])) - 15, 0)
+        i1 = min(int(df.index.searchsorted(t["exit_date"].iloc[-1])) + 10, len(df))
+        if i1 - i0 <= max_bars or len(t) <= 1:
+            break
+        t = t.iloc[1:]
+    d = df.iloc[i0:i1]
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"],
+                                 name="السعر", opacity=0.55))
+    for win, color, name in ((True, "#2ecc71", "رابحة"), (False, "#e74c3c", "خاسرة")):
+        part = t[(t["pnl"] > 0) == win]
+        xs, ys = [], []
+        for _, r in part.iterrows():
+            xs += [r["entry_date"], r["exit_date"], None]
+            ys += [r["entry"], r["exit"], None]
+        if xs:
+            fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(color=color, width=2), name=name))
+    for direction, sym_, col in (("BUY", "triangle-up", "#2ecc71"), ("SELL", "triangle-down", "#e74c3c")):
+        part = t[t["direction"] == direction]
+        if len(part):
+            fig.add_trace(go.Scatter(x=part["entry_date"], y=part["entry"], mode="markers",
+                                     marker=dict(symbol=sym_, size=12, color=col, line=dict(width=1, color="white")),
+                                     name=f"دخول {direction}",
+                                     text=[f"{direction} @ {P(e)}" for e in part["entry"]], hoverinfo="text"))
+    fig.add_trace(go.Scatter(x=t["exit_date"], y=t["exit"], mode="markers",
+                             marker=dict(symbol="x", size=10, color=["#2ecc71" if v > 0 else "#e74c3c" for v in t["pnl"]]),
+                             name="خروج",
+                             text=[f"{r} @ {P(x)} | {p_:+.2f}%" for r, x, p_ in zip(t["reason"], t["exit"], t["pnl"])],
+                             hoverinfo="text"))
+    fig.update_layout(title=title, template="plotly_white", height=520, xaxis_rangeslider_visible=False)
+    return fig
 
 
 def guess_contract_size(ticker):
@@ -1080,7 +1297,17 @@ def calc_pnl(pos, price):
     return (pos["entry_price"] - price) / pos["entry_price"] * 100
 
 
-def open_position(direction, price, ticker, atr):
+def meta_from(a, source):
+    """سياق الصفقة وقت الدخول (للتعلم لاحقاً)."""
+    if not a:
+        return {"source": source}
+    return {"source": source, "used": a.get("used"), "tf": a.get("tf"), "score": a.get("score"),
+            "adx": round(float(a["adx"]), 1) if a.get("adx") is not None else None,
+            "regime": a.get("regime"), "signal": a.get("signal"),
+            "decision": (a.get("arb") or {}).get("action", "")[:70]}
+
+
+def open_position(direction, price, ticker, atr, meta=None):
     sign = 1 if direction == "BUY" else -1
     st.session_state.current_position = {
         "direction": direction, "entry_price": price,
@@ -1089,21 +1316,29 @@ def open_position(direction, price, ticker, atr):
         "sl": price - sign * SL_ATR * atr,
         "tp": price + sign * TP2_ATR * atr,
         "atr": atr,
+        "meta": meta or {},
     }
+    persist()
 
 
 def close_trade(price, exit_reason):
-    pos = st.session_state.current_position
+    if st.session_state.current_position is None:
+        return
+    pos = dict(st.session_state.current_position)
+    meta = pos.pop("meta", None) or {}
     pnl = calc_pnl(pos, price)
+    risk_pct = abs(pos["entry_price"] - pos["sl"]) / pos["entry_price"] * 100
     st.session_state.trades.append({
-        **pos, "exit_price": price,
+        **pos, **meta, "exit_price": price,
         "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "exit_reason": exit_reason, "pnl_percent": pnl,
+        "r_multiple": (pnl / risk_pct) if risk_pct else None,
     })
     st.session_state.current_position = None
     why = {"SL": "ضُرب وقف الخسارة", "TP": "تحقق الهدف", "Manual": "أُغلقت يدوياً"}[exit_reason]
     kind = "success" if pnl > 0 else "error"
     st.session_state.notice = (kind, f"{'✅' if pnl > 0 else '❌'} {why} عند {P(price)} | النتيجة: {pnl:+.2f}%")
+    persist()
 
 
 def check_exit(price):
@@ -1177,6 +1412,14 @@ def run_diagnostics(t):
         txt, err, model = call_groq("Reply briefly.", "Reply with the single word OK", 0.0, get_groq_models(), budget=25)
         return (not err and bool(txt.strip())), (f"{model}: {txt.strip()[:40]}" if not err else err)
 
+    def jr():
+        obj, err = journal_load()
+        if err:
+            return False, f"({storage_mode()}) {err}"
+        e2 = journal_save(obj["trades"], obj["position"])  # كتابة اختبارية بنفس المحتوى
+        note = "" if storage_mode() == "gist" else " — مؤقت (أضف GITHUB_TOKEN وGIST_ID للدوام)"
+        return (not e2), (f"{storage_mode()}: {len(obj['trades'])} صفقة | الكتابة " + ("نجحت" if not e2 else f"فشلت: {e2}") + note)
+
     step("1) المفاتيح في Secrets", secrets)
     step(f"2) Yahoo يومي — {t}", yd)
     step(f"3) Yahoo ساعة (لإطار 4H) — {t}", yh)
@@ -1187,6 +1430,7 @@ def run_diagnostics(t):
     step("8) قائمة نماذج Groq", ql)
     step("9) نداء Groq", qc)
     step("10) وكيل الأخبار كاملاً (عناوين + تحليل)", nag)
+    step("11) التخزين الدائم للسجل", jr)
     return out
 
 
@@ -1298,6 +1542,8 @@ if analyze_btn:
 # عرض النتائج
 # ---------------------------------------------------------------------
 a = st.session_state.analysis
+if a is None:
+    render_tv_chart(None)
 if a is not None:
     plan = a["plan"]
 
@@ -1330,6 +1576,8 @@ if a is not None:
             st.caption("هذه نقاط جودة تجمع الفلاتر والوكلاء والأداء التاريخي، وليست احتمال ربح. "
                        "لا تُفسَّر كنسبة نجاح إلا بعد معايرتها على نتائج صفقاتك الفعلية.")
 
+    render_tv_chart(a)
+
     st.markdown(f"**الرمز:** {a['ticker']} | **الاستراتيجية المستخدمة:** {a['used']} | **الإطار:** {a.get('tf', TF_D1)} | **وقت التحليل:** {a['time']}")
 
     # ---- حالة السوق ----
@@ -1348,7 +1596,7 @@ if a is not None:
     c3.metric("ATR14", f"{P(a['atr'])}")
     c4.metric("EMA200", f"{P(a['ema200'])}")
 
-    st.markdown("## الرسم البياني")
+    st.markdown("## 📈 شارت الخطة (الدخول والوقف والأهداف)")
     st.plotly_chart(create_chart(a["df"], a["ticker"], plan["direction"], plan["sl"], plan["tp1"], plan["tp2"], a.get("tf", TF_D1)),
                     use_container_width=True)
 
@@ -1403,7 +1651,8 @@ if a is not None:
                 if ag["news_sources"]:
                     st.markdown("**المصادر:**")
                     for src_ in ag["news_sources"]:
-                        st.markdown(f"- [{src_['title']}]({src_['uri']})")
+                        _t = str(src_["title"]).replace("[", "(").replace("]", ")")   # لا تكسر عناوين الأخبار تنسيق الماركداون
+                        st.markdown(f"- [{_t}]({src_['uri']})")
                 else:
                     st.warning("⚠️ لا توجد عناوين مصدرية — تحقق من الأخبار يدوياً.")
 
@@ -1443,42 +1692,43 @@ if a is not None:
 # ---------------------------------------------------------------------
 # محاكي التداول
 # ---------------------------------------------------------------------
-if a is not None:
-    pos = st.session_state.current_position
+pos = st.session_state.current_position
+if st.session_state.notice:
+    kind, msg = st.session_state.notice
+    getattr(st, kind)(msg)
+    st.session_state.notice = None
+
+if a is not None or pos is not None:
     sim_ticker = pos["ticker"] if pos else a["ticker"]
     atr = pos["atr"] if pos else a["atr"]
-    price = st.session_state.live_price or a["price"]
+    last_close = a["price"] if (a and a["ticker"] == sim_ticker) else pos["entry_price"]
+    price = st.session_state.live_price or last_close
 
     st.markdown("---")
     st.header("🎯 محاكي التداول (Paper Trading)")
 
-    if st.session_state.notice:
-        kind, msg = st.session_state.notice
-        getattr(st, kind)(msg)
-        st.session_state.notice = None
-
-    src = "لحظي" if st.session_state.live_price else "آخر إغلاق"
+    src = "لحظي" if st.session_state.live_price else ("آخر إغلاق" if a else "سعر الدخول — اضغط تحديث السعر")
     st.markdown(f"**الأصل:** `{sim_ticker}` | **السعر ({src}):** `{P(price)}` | **ATR:** `{P(atr)}`")
 
     if st.button("🔄 تحديث السعر", use_container_width=True):
-        st.session_state.live_price = get_live_price(sim_ticker, a["price"])
+        st.session_state.live_price = get_live_price(sim_ticker, last_close)
         check_exit(st.session_state.live_price)
         st.rerun()
 
-    plan_dir = a["plan"]["direction"] if a["plan"]["level"] != "error" else None
+    plan_dir = a["plan"]["direction"] if (a and a["plan"]["level"] != "error") else None
     if st.button("📌 افتح الصفقة حسب الخطة", use_container_width=True, type="primary",
                  disabled=(pos is not None or plan_dir is None)):
-        open_position(plan_dir, price, sim_ticker, atr)
+        open_position(plan_dir, price, sim_ticker, atr, meta_from(a, "plan"))
         st.rerun()
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        if st.button("🟢 شراء يدوي", use_container_width=True, disabled=pos is not None):
-            open_position("BUY", price, sim_ticker, atr)
+        if st.button("🟢 شراء يدوي", use_container_width=True, disabled=(pos is not None or a is None)):
+            open_position("BUY", price, sim_ticker, atr, meta_from(a, "manual"))
             st.rerun()
     with col2:
-        if st.button("🔴 بيع يدوي", use_container_width=True, disabled=pos is not None):
-            open_position("SELL", price, sim_ticker, atr)
+        if st.button("🔴 بيع يدوي", use_container_width=True, disabled=(pos is not None or a is None)):
+            open_position("SELL", price, sim_ticker, atr, meta_from(a, "manual"))
             st.rerun()
     with col3:
         if st.button("⏹️ إغلاق الصفقة", use_container_width=True, disabled=pos is None):
@@ -1495,26 +1745,71 @@ if a is not None:
         c4.metric("الهدف", f"{P(pos['tp'])}")
         c5.metric("الربح الحالي", f"{cur:+.2f}%")
 
-    if st.session_state.trades:
-        st.markdown("### سجل الصفقات")
-        tdf = pd.DataFrame(st.session_state.trades)
-        disp = tdf[["entry_time", "ticker", "direction", "entry_price", "exit_price",
-                    "exit_reason", "pnl_percent"]].copy()
-        disp.columns = ["وقت الدخول", "الأصل", "الاتجاه", "سعر الدخول", "سعر الخروج", "سبب الخروج", "الربح %"]
-        st.dataframe(disp, use_container_width=True)
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("عدد الصفقات", len(tdf))
-        c2.metric("إجمالي الربح", f"{tdf['pnl_percent'].sum():+.2f}%")
-        c3.metric("نسبة الربح", f"{(tdf['pnl_percent'] > 0).mean() * 100:.1f}%")
-        c4.metric("رابحة", int((tdf["pnl_percent"] > 0).sum()))
-        c5.metric("خاسرة", int((tdf["pnl_percent"] <= 0).sum()))
+# ---------------------------------------------------------------------
+# 📒 السجل الدائم + إحصاءات التعلم
+# ---------------------------------------------------------------------
+st.markdown("---")
+st.header("📒 سجل الصفقات الدائم")
+if storage_mode() == "gist":
+    st.caption("💾 التخزين: GitHub Gist (دائم) ✅")
+else:
+    st.warning("💾 التخزين مؤقت (ملف محلي يُمسح عند إعادة تشغيل التطبيق). للحفظ الدائم أضف GITHUB_TOKEN و GIST_ID في Secrets.")
+if st.session_state.get("journal_load_err"):
+    st.error(f"تعذّر تحميل السجل: {st.session_state.journal_load_err} — لن يُحفظ أي شيء حتى يُحل الخطأ.")
+if st.session_state.get("journal_save_err"):
+    st.error(f"تعذّر حفظ السجل: {st.session_state.journal_save_err}")
 
-        d1, d2 = st.columns(2)
-        d1.download_button("⬇️ تنزيل السجل CSV", tdf.to_csv(index=False).encode("utf-8-sig"),
-                           "trades.csv", "text/csv", use_container_width=True)
-        if d2.button("🗑️ مسح السجل", use_container_width=True):
+trades = st.session_state.trades
+if not trades:
+    st.info("لا صفقات بعد. افتح صفقة من المحاكي ثم أغلقها لتظهر هنا.")
+else:
+    tdf = pd.DataFrame(trades)
+    tdf["pnl_percent"] = pd.to_numeric(tdf["pnl_percent"], errors="coerce")
+    names = {"entry_time": "وقت الدخول", "ticker": "الأصل", "direction": "الاتجاه", "entry_price": "سعر الدخول",
+             "exit_price": "سعر الخروج", "exit_reason": "سبب الخروج", "pnl_percent": "الربح %",
+             "r_multiple": "R", "score": "النقاط", "used": "الاستراتيجية", "tf": "الإطار", "source": "المصدر"}
+    cols = [c for c in names if c in tdf.columns]
+    disp = tdf[cols].copy()
+    for c in ("used", "tf"):
+        if c in disp:
+            disp[c] = disp[c].map(lambda x: x.split(" (")[0] if isinstance(x, str) else x)
+    for c in ("pnl_percent", "r_multiple"):
+        if c in disp:
+            disp[c] = pd.to_numeric(disp[c], errors="coerce").round(2)
+    st.dataframe(disp.rename(columns=names), use_container_width=True, hide_index=True)
+
+    wins = tdf["pnl_percent"] > 0
+    gw, gl = tdf.loc[wins, "pnl_percent"].sum(), abs(tdf.loc[~wins, "pnl_percent"].sum())
+    rr = pd.to_numeric(tdf["r_multiple"], errors="coerce").mean() if "r_multiple" in tdf else float("nan")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("عدد الصفقات", len(tdf))
+    m2.metric("نسبة الربح", f"{wins.mean() * 100:.1f}%")
+    m3.metric("متوسط R", f"{rr:.2f}" if rr == rr else "—")
+    m4.metric("PF", f"{gw / gl:.2f}" if gl > 0 else "∞")
+    st.caption("نتائج ورقية بدون تكلفة أو سبريد، فهي أفضل قليلاً من الواقع.")
+
+    with st.expander("📚 إحصاءات التعلم (أي الظروف تنجح؟)"):
+        if len(tdf) < 20:
+            st.warning("أقل من 20 صفقة: الإحصاءات للاطلاع فقط ولا يُبنى عليها قرار.")
+        groups = journal_groups(tdf)
+        for title, g in groups:
+            st.markdown(f"**حسب {title}**")
+            st.dataframe(g, use_container_width=True, hide_index=True)
+        top = tdf[pd.to_numeric(tdf["score"], errors="coerce") >= 85] if "score" in tdf else tdf.iloc[0:0]
+        if len(top) >= 10:
+            st.success(f"صفقات النقاط 85+: {len(top)} صفقة، نسبة ربحها {(top['pnl_percent'] > 0).mean() * 100:.1f}%.")
+        else:
+            st.info("لا توجد بعد عينة كافية (10 صفقات بنقاط 85+ على الأقل) لمعايرة النقاط بنتائجك الفعلية.")
+
+    d1, d2 = st.columns(2)
+    d1.download_button("⬇️ تنزيل السجل CSV", tdf.to_csv(index=False).encode("utf-8-sig"),
+                       "trades.csv", "text/csv", use_container_width=True)
+    with st.expander("⚠️ مسح السجل"):
+        sure = st.checkbox("أؤكد حذف كل الصفقات نهائياً", key="confirm_clear")
+        if st.button("🗑️ مسح السجل", disabled=not sure):
             st.session_state.trades = []
+            persist()
             st.rerun()
 
 # ---------------------------------------------------------------------
@@ -1546,7 +1841,7 @@ if st.button("▶️ شغّل الاختبار", use_container_width=True):
     else:
         with st.spinner("جاري الاختبار..."):
             try:
-                results, bh, bars, notes = {}, {}, {}, []
+                results, bh, bars, notes, prices = {}, {}, {}, [], {}
                 for tf in bt_tfs:
                     dfb, bias_b, err = load_prepared(bt_ticker, tf, True, bt_period)
                     if err:
@@ -1564,9 +1859,10 @@ if st.button("▶️ شغّل الاختبار", use_container_width=True):
                         results[(tf, name)] = {"trades": tr, "stats": backtest_stats(tr)}
                     bh[tf] = float((dfb["Close"].iloc[-1] / dfb["Close"].iloc[200] - 1) * 100)
                     bars[tf] = len(dfb) - 200
+                    prices[tf] = dfb[["Open", "High", "Low", "Close"]]
                 st.session_state.backtest = {
                     "ticker": bt_ticker, "period": bt_period, "cost": bt_cost,
-                    "results": results, "buy_hold": bh, "bars": bars, "notes": notes,
+                    "results": results, "buy_hold": bh, "bars": bars, "notes": notes, "prices": prices,
                 }
             except Exception as e:
                 st.error(f"خطأ في الاختبار: {e}")
@@ -1632,6 +1928,12 @@ if bt and "results" in bt and isinstance(bt.get("buy_hold"), dict):
                 show[col] = pd.to_datetime(show[col]).dt.strftime("%Y-%m-%d %H:%M")
             show[["entry", "exit", "pnl", "r"]] = show[["entry", "exit", "pnl", "r"]].round(2)
             st.dataframe(show, use_container_width=True, hide_index=True)
+            px_ = bt.get("prices", {}).get(pick[0])
+            if px_ is not None:
+                st.markdown("#### 📍 الدخول والخروج على الشارت")
+                st.plotly_chart(create_trades_chart(px_, tr_pick, f"{short(pick[0])} | {short(pick[1])} — آخر الصفقات"),
+                                use_container_width=True)
+                st.caption("▲ شراء ▼ بيع ✕ خروج. الخط الأخضر صفقة رابحة والأحمر خاسرة (يظهر حتى 25 صفقة أخيرة).")
 
         st.caption("⚠️ الأداء السابق لا يضمن المستقبل. اختبر عدة رموز ومدد، وتجنّب تعديل الأرقام حتى تعطي أفضل نتيجة (Overfitting). "
                    "على 4H تأكل التكلفة نسبة أكبر من الربح، فلا تجعلها أقل من الواقع.")
